@@ -14,6 +14,7 @@ using namespace std;
 
 static int VERBOSE = 0;
 static int MAX_SIZE = -1;
+static char version[] = "0.1.0";
 
 template<typename TimeT = chrono::milliseconds>
 struct measure
@@ -54,24 +55,26 @@ static void decodeData(ImageFileReaderInterface::DataVector data, Magick::Image 
         cout << "wrote " << data.size() << " bytes of HEVC to " << hevcFileName << endl;
     }
     chrono::steady_clock::time_point begin = chrono::steady_clock::now();
-    int retval = system(("ffmpeg -i " + hevcFileName + " -loglevel panic -frames:v 1 -vsync vfr -q:v 1 -y -an " + bmpFileName).c_str());
+    int retval = system(("ffmpeg -i " + hevcFileName + " -loglevel verbose -frames:v 1 -vsync vfr -q:v 1 -y -an " + bmpFileName).c_str());
     chrono::steady_clock::time_point end = chrono::steady_clock::now();
     remove(hevcFileName.c_str());
     if (retval != 0) {
         cerr << "ffmpeg failed with exit code " << retval << endl;
         string rm = "rmdir ";
         rm += tmpDirName;
+        system(rm.c_str());      
+        //exit(1);
+    } else {
+        *image = Magick::Image(bmpFileName);
+        remove(bmpFileName.c_str());
+        string rm = "rmdir ";
+        rm += tmpDirName;
         system(rm.c_str());
-        exit(1);
     }
+
     if (VERBOSE) {
         cout << "[timing] ffmpeg " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << "ms" << endl;
     }
-    *image = Magick::Image(bmpFileName);
-    remove(bmpFileName.c_str());
-    string rm = "rmdir ";
-    rm += tmpDirName;
-    system(rm.c_str());
 }
 
 static void addExif(ImageFileReaderInterface::DataVector exifData, string fileName)
@@ -125,102 +128,161 @@ static void processFile(char *filename, char *outputFileName)
         cout << "found " << gridItemIds.size() << " grid items\n";
     }
 
-    const uint32_t gridItemId = gridItemIds.at(0);
-    ImageFileReaderInterface::GridItem gridItem;
-    gridItem = reader.getItemGrid(contextId, gridItemId);
 
-    if (VERBOSE) {
-        cout << "grid is " << gridItem.outputWidth << "x" << gridItem.outputHeight << " pixels in tiles " << to_string(gridItem.columnsMinusOne + 1) << "x" << to_string(gridItem.rowsMinusOne + 1) << endl;
+    if (gridItemIds.size() > 0)
+    {
+        const uint32_t gridItemId = gridItemIds.at(0);
+        ImageFileReaderInterface::GridItem gridItem;
+        gridItem = reader.getItemGrid(contextId, gridItemId);
+    
+        if (VERBOSE) {
+            cout << "grid is " << gridItem.outputWidth << "x" << gridItem.outputHeight << " pixels in tiles " << to_string(gridItem.columnsMinusOne + 1) << "x" << to_string(gridItem.rowsMinusOne + 1) << endl;
+        }
+    
+        ImageFileReaderInterface::IdVector exifItemIds;
+        ImageFileReaderInterface::DataVector exifData;
+        reader.getReferencedToItemListByType(contextId, gridItemId, "cdsc", exifItemIds);
+
+        bool hasExifData = exifItemIds.size() > 0;
+        if (hasExifData) 
+        {
+            if (VERBOSE) {
+                cout << "found " << exifItemIds.size() << " cdsc items\n";
+            }
+            reader.getItemData(contextId, exifItemIds.at(0), exifData);
+            if (VERBOSE) {
+                cout << "read " << exifData.size() << " bytes of exif data\n";
+            }
+        }
+
+        ImageFileReaderInterface::IdVector tileItemIds;
+        reader.getItemListByType(contextId, "master", tileItemIds);
+        if (VERBOSE) {
+            cout << "found " << tileItemIds.size() << " tile images\n";
+        }
+    
+        // Always reuse the parameter set from the first tile, sometimes tile 7 or 8 is corrupted
+        HevcImageFileReader::ParameterSetMap parameterSet;
+        reader.getDecoderParameterSets(contextId, tileItemIds.at(0), parameterSet);
+        string codeType = reader.getDecoderCodeType(contextId, tileItemIds.at(0));
+        ImageFileReaderInterface::DataVector parametersData;
+        if ((codeType == "hvc1") || (codeType == "lhv1")) {
+            // VPS (HEVC specific)
+            parametersData.insert(parametersData.end(), parameterSet.at("VPS").begin(), parameterSet.at("VPS").end());
+        }
+    
+        if ((codeType == "avc1") || (codeType == "hvc1") || (codeType == "lhv1")) {
+            // SPS and PPS
+            parametersData.insert(parametersData.end(), parameterSet.at("SPS").begin(), parameterSet.at("SPS").end());
+            parametersData.insert(parametersData.end(), parameterSet.at("PPS").begin(), parameterSet.at("PPS").end());
+        } else {
+            // No other code types supported
+            throw ImageFileReaderInterface::FileReaderException(ImageFileReaderInterface::FileReaderException::StatusCode::UNSUPPORTED_CODE_TYPE);
+        }
+    
+        ImageFileReaderInterface::DataVector itemDataWithDecoderParameters;
+        ImageFileReaderInterface::DataVector itemData;
+    
+        vector<Magick::Image> tileImages;
+        for (auto& tileItemId: tileItemIds) {
+            itemDataWithDecoderParameters.clear();
+            itemDataWithDecoderParameters.insert(itemDataWithDecoderParameters.end(), parametersData.begin(), parametersData.end());
+    
+            itemData.clear();
+            reader.getItemData(contextId, tileItemId, itemData);
+    
+            // +1 comes from skipping first zero after decoder parameters
+            itemDataWithDecoderParameters.insert(itemDataWithDecoderParameters.end(), itemData.begin() + 1, itemData.end());
+    
+            Magick::Image image;
+            decodeData(itemDataWithDecoderParameters, &image);              
+            tileImages.push_back(image);
+        }
+    
+        chrono::steady_clock::time_point begin = chrono::steady_clock::now();
+        Magick::Montage montageOptions;
+        montageOptions.tile(to_string(gridItem.columnsMinusOne + 1) + "x" + to_string(gridItem.rowsMinusOne + 1));
+        montageOptions.geometry("512x512");
+        list<Magick::Image> montage;
+        Magick::montageImages(&montage, tileImages.begin(), tileImages.end(), montageOptions);
+        Magick::Image image = montage.front();
+        image.magick("JPEG");
+        image.crop(Magick::Geometry(gridItem.outputWidth, gridItem.outputHeight));
+        image.quality(92);
+    
+        string timingName = "magick montage+crop";
+        if (MAX_SIZE > 0) {
+            double scaleFactor;
+            if (gridItem.outputWidth > gridItem.outputHeight) {
+                scaleFactor = (double)MAX_SIZE / (double)gridItem.outputWidth;
+            } else {
+                scaleFactor = (double)MAX_SIZE / (double)gridItem.outputHeight;
+            }
+    
+            if (scaleFactor < 1) {
+                image.zoom(Magick::Geometry(scaleFactor * gridItem.outputWidth, scaleFactor * gridItem.outputHeight));
+                timingName += "+zoom";
+            }
+        }
+        image.write(outputFileName);
+        chrono::steady_clock::time_point end = chrono::steady_clock::now();
+    
+        if (VERBOSE) {
+            cout << "[timing] " << timingName << " " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << "ms" << endl;
+        }
+    
+        if (hasExifData) 
+        {
+            addExif(exifData, outputFileName);
+        }
+        
     }
+    // Try to generate from master image && Verify that the file has master image
+    else if ((properties.fileFeature.hasFeature(ImageFileReaderInterface::FileFeature::HasSingleImage) ||
+              properties.fileFeature.hasFeature(ImageFileReaderInterface::FileFeature::HasImageCollection)))
+    {
+        ImageFileReaderInterface::DataVector data;
+        ImageFileReaderInterface::IdVector itemIds;
 
-    ImageFileReaderInterface::IdVector exifItemIds;
-    ImageFileReaderInterface::DataVector exifData;
-    reader.getReferencedToItemListByType(contextId, gridItemId, "cdsc", exifItemIds);
-    if (VERBOSE) {
-        cout << "found " << exifItemIds.size() << " cdsc items\n";
-    }
-    reader.getItemData(contextId, exifItemIds.at(0), exifData);
-    if (VERBOSE) {
-        cout << "read " << exifData.size() << " bytes of exif data\n";
-    }
+        // Find the item ID of the first master image
+        const uint32_t contextId = properties.rootLevelMetaBoxProperties.contextId;
+        reader.getItemListByType(contextId, "master", itemIds);
+        const uint32_t masterId = itemIds.at(0);
 
-    ImageFileReaderInterface::IdVector tileItemIds;
-    reader.getItemListByType(contextId, "master", tileItemIds);
-    if (VERBOSE) {
-        cout << "found " << tileItemIds.size() << " tile images\n";
-    }
+        reader.getItemDataWithDecoderParameters(contextId, masterId, data);
 
-    // Always reuse the parameter set from the first tile, sometimes tile 7 or 8 is corrupted
-    HevcImageFileReader::ParameterSetMap parameterSet;
-    reader.getDecoderParameterSets(contextId, tileItemIds.at(0), parameterSet);
-    string codeType = reader.getDecoderCodeType(contextId, tileItemIds.at(0));
-    ImageFileReaderInterface::DataVector parametersData;
-    if ((codeType == "hvc1") || (codeType == "lhv1")) {
-        // VPS (HEVC specific)
-        parametersData.insert(parametersData.end(), parameterSet.at("VPS").begin(), parameterSet.at("VPS").end());
-    }
-
-    if ((codeType == "avc1") || (codeType == "hvc1") || (codeType == "lhv1")) {
-        // SPS and PPS
-        parametersData.insert(parametersData.end(), parameterSet.at("SPS").begin(), parameterSet.at("SPS").end());
-        parametersData.insert(parametersData.end(), parameterSet.at("PPS").begin(), parameterSet.at("PPS").end());
-    } else {
-        // No other code types supported
-        throw ImageFileReaderInterface::FileReaderException(ImageFileReaderInterface::FileReaderException::StatusCode::UNSUPPORTED_CODE_TYPE);
-    }
-
-    ImageFileReaderInterface::DataVector itemDataWithDecoderParameters;
-    ImageFileReaderInterface::DataVector itemData;
-
-    vector<Magick::Image> tileImages;
-    for (auto& tileItemId: tileItemIds) {
-        itemDataWithDecoderParameters.clear();
-        itemDataWithDecoderParameters.insert(itemDataWithDecoderParameters.end(), parametersData.begin(), parametersData.end());
-
-        itemData.clear();
-        reader.getItemData(contextId, tileItemId, itemData);
-
-        // +1 comes from skipping first zero after decoder parameters
-        itemDataWithDecoderParameters.insert(itemDataWithDecoderParameters.end(), itemData.begin() + 1, itemData.end());
+        ImageFileReaderInterface::DataVector itemDataWithDecoderParameters;   
+        itemDataWithDecoderParameters.insert(itemDataWithDecoderParameters.end(), data.begin() + 1, data.end());
 
         Magick::Image image;
         decodeData(itemDataWithDecoderParameters, &image);
-        tileImages.push_back(image);
+
+        image.magick("JPEG");
+        image.write(outputFileName);
+
+    } 
+    // Try to generate from cover image && Verify that the file has a cover image
+    else if (properties.fileFeature.hasFeature(ImageFileReaderInterface::FileFeature::HasCoverImage))
+    {
+        // The cover image is always located in the root level MetaBox, so get MetaBox context ID.
+        const uint32_t contextId = properties.rootLevelMetaBoxProperties.contextId;
+    
+        // Find the item ID
+        const uint32_t itemId = reader.getCoverImageItemId(contextId);
+    
+        ImageFileReaderInterface::DataVector data;
+        reader.getItemDataWithDecoderParameters(contextId, itemId, data);
+
+        ImageFileReaderInterface::DataVector itemDataWithDecoderParameters;   
+        itemDataWithDecoderParameters.insert(itemDataWithDecoderParameters.end(), data.begin() + 1, data.end());
+
+        Magick::Image image;
+        decodeData(itemDataWithDecoderParameters, &image);
+
+        image.magick("JPEG");
+        image.write(outputFileName);
     }
 
-    chrono::steady_clock::time_point begin = chrono::steady_clock::now();
-    Magick::Montage montageOptions;
-    montageOptions.tile(to_string(gridItem.columnsMinusOne + 1) + "x" + to_string(gridItem.rowsMinusOne + 1));
-    montageOptions.geometry("512x512");
-    list<Magick::Image> montage;
-    Magick::montageImages(&montage, tileImages.begin(), tileImages.end(), montageOptions);
-    Magick::Image image = montage.front();
-    image.magick("JPEG");
-    image.crop(Magick::Geometry(gridItem.outputWidth, gridItem.outputHeight));
-    image.quality(92);
-
-    string timingName = "magick montage+crop";
-    if (MAX_SIZE > 0) {
-        double scaleFactor;
-        if (gridItem.outputWidth > gridItem.outputHeight) {
-            scaleFactor = (double)MAX_SIZE / (double)gridItem.outputWidth;
-        } else {
-            scaleFactor = (double)MAX_SIZE / (double)gridItem.outputHeight;
-        }
-
-        if (scaleFactor < 1) {
-            image.zoom(Magick::Geometry(scaleFactor * gridItem.outputWidth, scaleFactor * gridItem.outputHeight));
-            timingName += "+zoom";
-        }
-    }
-    image.write(outputFileName);
-    chrono::steady_clock::time_point end = chrono::steady_clock::now();
-
-    if (VERBOSE) {
-        cout << "[timing] " << timingName << " " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << "ms" << endl;
-    }
-
-    addExif(exifData, outputFileName);
 }
 
 int usage()
@@ -231,6 +293,8 @@ int usage()
 
 int main(int argc, char *argv[])
 {
+
+    cout << "Heif To Jpeg version : " << version << endl;
     Magick::InitializeMagick(*argv);
 
     char *inputFileName = NULL;
@@ -270,6 +334,19 @@ int main(int argc, char *argv[])
 
     try {
         chrono::steady_clock::time_point begin = chrono::steady_clock::now();
+
+        if (!inputFileName)
+        {
+            cerr << "Please select input file!" << endl;
+            return usage();
+        }
+
+        if (!outputFileName)
+        {
+            cerr << "Please select output file!" << endl;
+            return usage(); 
+        }
+
         processFile(inputFileName, outputFileName);
         chrono::steady_clock::time_point end = chrono::steady_clock::now();
         if (VERBOSE) {
